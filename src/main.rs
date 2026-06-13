@@ -586,6 +586,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("COLORTERM").map_or(false, |v| v == "truecolor" || v == "24bit");
     let frame_time = Duration::from_secs_f64(1.0 / 30.0);
 
+    let mut prev_hx = 0.5f32;
+    let mut prev_hy = 0.5f32;
+
     let result = loop {
         let frame_start = Instant::now();
 
@@ -637,29 +640,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let hy = (y1 + y2) as f32 / (2.0 * fh as f32);
                 let hs = ((x2 - x1) * (y2 - y1)) as f32 / (fw * fh) as f32;
 
+                // Velocity — movement speed triggers percussive bursts
+                let dx = hx - prev_hx;
+                let dy = hy - prev_hy;
+                let vel = (dx * dx + dy * dy).sqrt() * 12.0;
+                let v_boost = vel.min(1.0);
+                prev_hx = hx;
+                prev_hy = hy;
+
                 p.hand_x = hx;
                 p.hand_y = hy;
                 p.hand_size = hs.min(1.0);
 
-                // Hand X → pan & detune
+                // ---- Hand X → pan (full range) ----
                 p.pan = hx.clamp(0.0, 1.0);
-                p.detune = 0.99 + hx * 0.06;
-                // Hand Y → freq & cutoff
+
+                // ---- Velocity → detune wobble (speed = pitch shimmy) ----
+                p.detune = 1.0 + v_boost * 0.04;
+
+                // ---- Hand Y → freq & cutoff (linear, instant) ----
                 p.freq = 40.0 + (1.0 - hy) * 1960.0;
                 p.cutoff = 30.0 + (1.0 - hy) * 9970.0;
-                // Hand size → gain & modulation
-                p.mod_amt = (hs * 0.6).min(0.5);
-                p.mod_freq = 0.5 + (1.0 - hs) * 29.5;
-                p.gain = (0.04 + hs * 0.5).max(0.04).min(0.9);
 
-                // Fingers → oscillator & filter type
-                p.osc_type = ((finger_count as f32) / 5.0 * 3.5).floor().clamp(0.0, 3.0);
-                p.filter_type = ((finger_count as f32) / 5.0 * 2.5).floor().clamp(0.0, 2.0);
-            }
-            if has_head {
-                p.head_x = head_nx;
-                p.head_y = head_ny;
-                p.reverb_mix = (0.7 - head_ny * 0.6).clamp(0.0, 0.7);
+                // ---- Hand size → gain & modulation ----
+                p.mod_amt = ((1.0 - hs) * 0.6).min(0.5);
+                p.mod_freq = 0.5 + hs * 29.5;
+                p.gain = (0.04 + hs * 0.8).max(0.04).min(0.9);
+
+                // ---- Velocity → gain burst + mod sweep ----
+                if vel > 0.05 {
+                    p.gain = (p.gain + v_boost * 0.3).min(0.9);
+                    p.mod_freq = (p.mod_freq + v_boost * 30.0).min(30.0);
+                    p.mod_amt = (p.mod_amt + v_boost * 0.3).min(0.6);
+                    // Direction: moving up = pitch sweep
+                    if dy < 0.0 {
+                        p.freq = (p.freq + v_boost * 500.0).min(2000.0);
+                    }
+                }
+
+                // ---- Fingers → osc & filter combos ----
+                let fc = finger_count.min(5);
+                let osc_table = [0.0, 1.0, 0.0, 2.0, 3.0, 2.0];
+                let flt_table = [0.0, 0.0, 1.0, 1.0, 2.0, 2.0];
+                p.osc_type = osc_table[fc];
+                p.filter_type = flt_table[fc];
+
+                // ---- Head → reverb mix ----
+                if has_head {
+                    p.reverb_mix = (0.7 - head_ny * 0.6).clamp(0.0, 0.7);
+                    p.head_x = head_nx;
+                    p.head_y = head_ny;
+                }
+            } else {
+                // No hand → instant silence
+                p.gain = 0.0;
+                p.mod_freq = 1.0;
+                p.detune = 1.0;
+                prev_hx = 0.5;
+                prev_hy = 0.5;
+
+                if has_head {
+                    p.reverb_mix = (0.5 - head_ny * 0.4).clamp(0.0, 0.5);
+                    p.freq = 80.0 + (1.0 - head_ny) * 400.0;
+                    p.cutoff = 100.0 + (1.0 - head_ny) * 2000.0;
+                    p.gain = 0.08;
+                }
             }
         }
 
