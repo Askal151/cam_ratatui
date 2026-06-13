@@ -338,6 +338,43 @@ fn build_ascii_frame(
     (text, fg_colors)
 }
 
+fn overlay_bbox(
+    text: &mut [Vec<char>],
+    colors: &mut [Vec<(u8, u8, u8)>],
+    fw: usize, fh: usize,
+    bbox: (usize, usize, usize, usize),
+    ascii_cols: usize, ascii_rows: usize,
+) {
+    let (x1, y1, x2, y2) = bbox;
+    if x2 <= x1 || y2 <= y1 { return; }
+
+    // Map pixel coords to ASCII grid
+    let ax1 = (x1 * ascii_cols / fw).clamp(0, ascii_cols.saturating_sub(1));
+    let ax2 = (x2 * ascii_cols / fw).clamp(0, ascii_cols.saturating_sub(1));
+    let ay1 = (y1 * ascii_rows / fh).clamp(0, ascii_rows.saturating_sub(1));
+    let ay2 = (y2 * ascii_rows / fh).clamp(0, ascii_rows.saturating_sub(1));
+
+    if ax2 - ax1 < 2 || ay2 - ay1 < 2 { return; }
+
+    let green: (u8, u8, u8) = (0, 255, 0);
+    for x in ax1..=ax2 {
+        if x < ascii_cols {
+            if ay1 < ascii_rows { text[ay1][x] = '─'; colors[ay1][x] = green; }
+            if ay2 < ascii_rows { text[ay2][x] = '─'; colors[ay2][x] = green; }
+        }
+    }
+    for y in ay1..=ay2 {
+        if y < ascii_rows {
+            if ax1 < ascii_cols { text[y][ax1] = '│'; colors[y][ax1] = green; }
+            if ax2 < ascii_cols { text[y][ax2] = '│'; colors[y][ax2] = green; }
+        }
+    }
+    if ay1 < ascii_rows && ax1 < ascii_cols { text[ay1][ax1] = '┌'; colors[ay1][ax1] = green; }
+    if ay1 < ascii_rows && ax2 < ascii_cols { text[ay1][ax2] = '┐'; colors[ay1][ax2] = green; }
+    if ay2 < ascii_rows && ax1 < ascii_cols { text[ay2][ax1] = '└'; colors[ay2][ax1] = green; }
+    if ay2 < ascii_rows && ax2 < ascii_cols { text[ay2][ax2] = '┘'; colors[ay2][ax2] = green; }
+}
+
 struct AsciiWidget {
     text: Vec<Vec<char>>,
     colors: Vec<Vec<(u8, u8, u8)>>,
@@ -380,6 +417,7 @@ struct HandResult {
     hand_x: f32,
     hand_y: f32,
     hand_bbox_size: f32,
+    bbox_px: (usize, usize, usize, usize), // min_x, min_y, max_x, max_y
     finger_count: usize,
     hand_openness: f32,
     head_x: f32,
@@ -418,6 +456,7 @@ fn track_hand(rgb_data: &[u8], w: usize, h: usize) -> HandResult {
     if skin_pixels.len() < 10 {
         return HandResult {
             hand_x: 0.5, hand_y: 0.5, hand_bbox_size: 0.1,
+            bbox_px: (0, 0, 0, 0),
             finger_count: 0, hand_openness: 0.0,
             head_x: 0.5, head_y: 0.5,
             has_hand: false, has_head: false,
@@ -464,6 +503,7 @@ fn track_hand(rgb_data: &[u8], w: usize, h: usize) -> HandResult {
     if mean_dist < 2.0 {
         return HandResult {
             hand_x, hand_y, hand_bbox_size,
+            bbox_px: (min_x as usize, min_y as usize, max_x as usize, max_y as usize),
             finger_count: 0, hand_openness: 0.0,
             head_x: 0.5, head_y: 0.5,
             has_hand: true, has_head: false,
@@ -521,6 +561,7 @@ fn track_hand(rgb_data: &[u8], w: usize, h: usize) -> HandResult {
 
     HandResult {
         hand_x, hand_y, hand_bbox_size,
+        bbox_px: (min_x as usize, min_y as usize, max_x as usize, max_y as usize),
         finger_count: finger_count.min(5),
         hand_openness,
         head_x, head_y,
@@ -565,6 +606,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Gesture tracking
         let hr = track_hand(&rgb, fw, fh);
+        let bbox_px = hr.bbox_px;
 
         // Map gesture to audio params
         if let Ok(mut p) = gesture_params.lock() {
@@ -620,7 +662,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let info_rows = 4usize;
             if rows > info_rows + 5 {
                 let ascii_rows = rows - info_rows;
-                let (text, colors) = build_ascii_frame(&rgb, fw, fh, cols, ascii_rows, use_color);
+                let (mut text, mut colors) = build_ascii_frame(&rgb, fw, fh, cols, ascii_rows, use_color);
+                if hr.has_hand {
+                    overlay_bbox(&mut text, &mut colors, fw, fh, bbox_px, cols, ascii_rows);
+                }
 
                 if let Err(e) = terminal.draw(|f| {
                     let area = f.area();
