@@ -338,17 +338,18 @@ fn build_ascii_frame(
     (text, fg_colors)
 }
 
-fn overlay_bbox(
+fn overlay_bbox_color(
     text: &mut [Vec<char>],
     colors: &mut [Vec<(u8, u8, u8)>],
     fw: usize, fh: usize,
     bbox: (usize, usize, usize, usize),
     ascii_cols: usize, ascii_rows: usize,
+    col: (u8, u8, u8),
+    _label: &str,
 ) {
     let (x1, y1, x2, y2) = bbox;
     if x2 <= x1 || y2 <= y1 { return; }
 
-    // Map pixel coords to ASCII grid
     let ax1 = (x1 * ascii_cols / fw).clamp(0, ascii_cols.saturating_sub(1));
     let ax2 = (x2 * ascii_cols / fw).clamp(0, ascii_cols.saturating_sub(1));
     let ay1 = (y1 * ascii_rows / fh).clamp(0, ascii_rows.saturating_sub(1));
@@ -356,23 +357,22 @@ fn overlay_bbox(
 
     if ax2 - ax1 < 2 || ay2 - ay1 < 2 { return; }
 
-    let green: (u8, u8, u8) = (0, 255, 0);
     for x in ax1..=ax2 {
         if x < ascii_cols {
-            if ay1 < ascii_rows { text[ay1][x] = '─'; colors[ay1][x] = green; }
-            if ay2 < ascii_rows { text[ay2][x] = '─'; colors[ay2][x] = green; }
+            if ay1 < ascii_rows { text[ay1][x] = '─'; colors[ay1][x] = col; }
+            if ay2 < ascii_rows { text[ay2][x] = '─'; colors[ay2][x] = col; }
         }
     }
     for y in ay1..=ay2 {
         if y < ascii_rows {
-            if ax1 < ascii_cols { text[y][ax1] = '│'; colors[y][ax1] = green; }
-            if ax2 < ascii_cols { text[y][ax2] = '│'; colors[y][ax2] = green; }
+            if ax1 < ascii_cols { text[y][ax1] = '│'; colors[y][ax1] = col; }
+            if ax2 < ascii_cols { text[y][ax2] = '│'; colors[y][ax2] = col; }
         }
     }
-    if ay1 < ascii_rows && ax1 < ascii_cols { text[ay1][ax1] = '┌'; colors[ay1][ax1] = green; }
-    if ay1 < ascii_rows && ax2 < ascii_cols { text[ay1][ax2] = '┐'; colors[ay1][ax2] = green; }
-    if ay2 < ascii_rows && ax1 < ascii_cols { text[ay2][ax1] = '└'; colors[ay2][ax1] = green; }
-    if ay2 < ascii_rows && ax2 < ascii_cols { text[ay2][ax2] = '┘'; colors[ay2][ax2] = green; }
+    if ay1 < ascii_rows && ax1 < ascii_cols { text[ay1][ax1] = '┌'; colors[ay1][ax1] = col; }
+    if ay1 < ascii_rows && ax2 < ascii_cols { text[ay1][ax2] = '┐'; colors[ay1][ax2] = col; }
+    if ay2 < ascii_rows && ax1 < ascii_cols { text[ay2][ax1] = '└'; colors[ay2][ax1] = col; }
+    if ay2 < ascii_rows && ax2 < ascii_cols { text[ay2][ax2] = '┘'; colors[ay2][ax2] = col; }
 }
 
 struct AsciiWidget {
@@ -404,7 +404,7 @@ impl Widget for AsciiWidget {
     }
 }
 
-// =========================== Gesture tracking ===========================
+// =========================== Multi-object tracking ===========================
 
 fn is_skin(r: u8, g: u8, b: u8) -> bool {
     let r = r as i32;
@@ -413,160 +413,154 @@ fn is_skin(r: u8, g: u8, b: u8) -> bool {
     r > 60 && g > 30 && b > 15 && r > g && r > b && (r - g).abs() > 12
 }
 
-struct HandResult {
-    hand_x: f32,
-    hand_y: f32,
-    hand_bbox_size: f32,
-    bbox_px: (usize, usize, usize, usize), // min_x, min_y, max_x, max_y
-    finger_count: usize,
-    hand_openness: f32,
-    head_x: f32,
-    head_y: f32,
-    has_hand: bool,
-    has_head: bool,
+struct Blob {
+    label: u32,
+    pixels: usize,
+    cx: f32,
+    cy: f32,
+    min_x: usize,
+    max_x: usize,
+    min_y: usize,
+    max_y: usize,
 }
 
-fn track_hand(rgb_data: &[u8], w: usize, h: usize) -> HandResult {
-    let step = 4usize.max(w / 80);
+/// Two-pass connected component labeling on a stepped skin mask.
+fn find_blobs(rgb_data: &[u8], w: usize, h: usize, step: usize) -> Vec<Blob> {
+    let step = step.max(2);
+    let sw = w / step;
+    let sh = h / step;
+    if sw < 2 || sh < 2 { return vec![]; }
 
-    // Pass 1: collect skin pixels and compute overall centroid/bbox
-    let mut skin_pixels: Vec<(usize, usize)> = Vec::with_capacity((w * h) / (step * step));
-    let mut total_x: f32 = 0.0;
-    let mut total_y: f32 = 0.0;
-    let mut min_x = w as f32;
-    let mut max_x = 0.0f32;
-    let mut min_y = h as f32;
-    let mut max_y = 0.0f32;
+    // Build low-res mask
+    let mut mask = vec![false; sw * sh];
+    for y in 0..sh {
+        for x in 0..sw {
+            let i = (y * step * w + x * step) * 3;
+            mask[y * sw + x] = is_skin(rgb_data[i], rgb_data[i + 1], rgb_data[i + 2]);
+        }
+    }
 
-    for y in (0..h).step_by(step) {
-        for x in (0..w).step_by(step) {
-            let i = (y * w + x) * 3;
-            if is_skin(rgb_data[i], rgb_data[i + 1], rgb_data[i + 2]) {
-                skin_pixels.push((x, y));
-                total_x += x as f32;
-                total_y += y as f32;
-                if (x as f32) < min_x { min_x = x as f32; }
-                if (x as f32) > max_x { max_x = x as f32; }
-                if (y as f32) < min_y { min_y = y as f32; }
-                if (y as f32) > max_y { max_y = y as f32; }
+    // First pass: provisional labels
+    let mut labels = vec![0u32; sw * sh];
+    let mut next_label = 1u32;
+    let mut eq: Vec<(u32, u32)> = Vec::new();
+
+    for y in 0..sh {
+        for x in 0..sw {
+            if !mask[y * sw + x] { continue; }
+            let l = if x > 0 { labels[y * sw + x - 1] } else { 0 };
+            let u = if y > 0 { labels[(y - 1) * sw + x] } else { 0 };
+            if l == 0 && u == 0 {
+                labels[y * sw + x] = next_label;
+                next_label += 1;
+            } else if l != 0 && u != 0 && l != u {
+                let (a, b) = (l.min(u), l.max(u));
+                labels[y * sw + x] = a;
+                eq.push((a, b));
+            } else {
+                labels[y * sw + x] = if l != 0 { l } else { u };
             }
         }
     }
 
-    if skin_pixels.len() < 10 {
-        return HandResult {
-            hand_x: 0.5, hand_y: 0.5, hand_bbox_size: 0.1,
-            bbox_px: (0, 0, 0, 0),
-            finger_count: 0, hand_openness: 0.0,
-            head_x: 0.5, head_y: 0.5,
-            has_hand: false, has_head: false,
-        };
+    let total = next_label;
+    if total == 1 { return vec![]; }
+
+    // Resolve equivalences (DSU)
+    let mut parent: Vec<u32> = (0..total).collect();
+    fn find(parent: &mut [u32], x: u32) -> u32 {
+        let xi = x as usize;
+        if parent[xi] != x {
+            parent[xi] = find(parent, parent[xi]);
+        }
+        parent[xi]
+    }
+    for &(a, b) in &eq {
+        let ra = find(&mut parent, a);
+        let rb = find(&mut parent, b);
+        if ra != rb { parent[rb as usize] = ra; }
+    }
+    for i in 0..total as usize { let pi = parent[i]; parent[i] = find(&mut parent, pi); }
+
+    // Second pass: rewrite labels
+    let mut label_map: Vec<u32> = vec![0; total as usize];
+    let mut unique_count = 0u32;
+    for i in 1..total as usize {
+        let p = parent[i] as usize;
+        if label_map[p] == 0 { unique_count += 1; label_map[p] = unique_count; }
     }
 
-    let n = skin_pixels.len() as f32;
-    let cx = total_x / n;
-    let cy = total_y / n;
+    // Accumulate component stats
+    let mut blobs: Vec<Blob> = (0..unique_count).map(|_| Blob {
+        label: 0, pixels: 0, cx: 0.0, cy: 0.0,
+        min_x: sw, max_x: 0, min_y: sh, max_y: 0,
+    }).collect();
 
-    // Normalize to 0-1
-    let hand_x = cx / w as f32;
-    let hand_y = cy / h as f32;
-    let bbox_w = (max_x - min_x) / w as f32;
-    let bbox_h = (max_y - min_y) / h as f32;
-    let hand_bbox_size = (bbox_w * bbox_h).min(1.0);
-
-    // Pass 2: radial profile from centroid for finger counting
-    let num_angles = 36;
-    let angle_step = (std::f32::consts::TAU / num_angles as f32);
-    let mut radial_dist = vec![0.0f32; num_angles];
-
-    for &(px, py) in &skin_pixels {
-        let dx = px as f32 - cx;
-        let dy = py as f32 - cy;
-        let dist = (dx * dx + dy * dy).sqrt();
-        let angle = dy.atan2(dx) + std::f32::consts::PI; // 0..TAU
-        let idx = (angle / angle_step) as usize % num_angles;
-        if dist > radial_dist[idx] {
-            radial_dist[idx] = dist;
+    for y in 0..sh {
+        for x in 0..sw {
+            if !mask[y * sw + x] { continue; }
+            let orig = labels[y * sw + x];
+            let final_label = label_map[parent[orig as usize] as usize] - 1;
+            let b = &mut blobs[final_label as usize];
+            b.label = final_label;
+            b.pixels += 1;
+            b.cx += x as f32;
+            b.cy += y as f32;
+            b.min_x = b.min_x.min(x);
+            b.max_x = b.max_x.max(x);
+            b.min_y = b.min_y.min(y);
+            b.max_y = b.max_y.max(y);
         }
     }
 
-    // Smooth radial profile (3-point moving average)
-    let mut smoothed = radial_dist.clone();
-    for i in 0..num_angles {
-        let prev = radial_dist[(i + num_angles - 1) % num_angles];
-        let next = radial_dist[(i + 1) % num_angles];
-        smoothed[i] = (prev + radial_dist[i] + next) / 3.0;
+    // Convert from stepped coords to pixel coords, compute centroids
+    for b in &mut blobs {
+        b.cx = b.cx / b.pixels as f32 * step as f32;
+        b.cy = b.cy / b.pixels as f32 * step as f32;
+        b.min_x *= step;
+        b.max_x = (b.max_x + 1) * step;
+        b.min_y *= step;
+        b.max_y = (b.max_y + 1) * step;
     }
 
-    // Find mean distance to normalize
-    let mean_dist: f32 = smoothed.iter().sum::<f32>() / num_angles as f32;
-    if mean_dist < 2.0 {
-        return HandResult {
-            hand_x, hand_y, hand_bbox_size,
-            bbox_px: (min_x as usize, min_y as usize, max_x as usize, max_y as usize),
-            finger_count: 0, hand_openness: 0.0,
-            head_x: 0.5, head_y: 0.5,
-            has_hand: true, has_head: false,
-        };
-    }
+    // Filter small blobs
+    blobs.retain(|b| b.pixels >= 5);
+    blobs.sort_by(|a, b| b.pixels.cmp(&a.pixels));
+    blobs
+}
 
-    // Count peaks in upper half (angles 9..27 correspond to top of hand in image coords)
-    // In image coords: angle 0 = right, angle 9 = bottom, angle 18 = left, angle 27 = top
-    // Fingers extend upward => angles around 27 (top) to 9 (bottom wrapping)
-    let peak_angle_start = 18 + 4;  // slightly left of top
-    let peak_angle_end = 36 - 4;    // slightly right of top
-    let peak_threshold = 1.25;
+/// Classify blobs into named body parts by position & size.
+fn classify_blobs(blobs: &[Blob], w: usize, h: usize) -> Vec<(&'static str, (usize, usize, usize, usize), f32, f32)> {
+    let mut result: Vec<(&str, (usize, usize, usize, usize), f32, f32)> = Vec::new();
+    let fw = w as f32;
+    let fh = h as f32;
 
-    let mut finger_count = 0usize;
-    for i in peak_angle_start..peak_angle_end {
-        let ii = i % num_angles;
-        let prev = smoothed[(ii + num_angles - 1) % num_angles];
-        let next = smoothed[(ii + 1) % num_angles];
-        if smoothed[ii] > prev && smoothed[ii] > next && smoothed[ii] > mean_dist * peak_threshold {
-            finger_count += 1;
+    for b in blobs {
+        let bw = (b.max_x - b.min_x) as f32 / fw;
+        let bh = (b.max_y - b.min_y) as f32 / fh;
+        let nx = b.cx / fw;
+        let ny = b.cy / fh;
+        let area = bw * bh;
+        let bbox = (b.min_x, b.min_y, b.max_x, b.max_y);
+
+        // Head: high in frame, moderate size, roughly circular
+        if ny < 0.45 && area < 0.25 && bh < 0.35 && bw * 1.5 > bh {
+            result.push(("head", bbox, nx, ny));
+        // Fingers: small, elongated, at edges of hand region
+        } else if area < 0.06 && (bw < 0.15 || bh < 0.15) {
+            result.push(("finger", bbox, nx, ny));
+        // Hand: medium, mid-frame
+        } else if area < 0.3 && ny < 0.75 && ny > 0.1 {
+            result.push(("hand", bbox, nx, ny));
+        // Body: large, lower frame
+        } else if area > 0.08 && ny > 0.3 {
+            result.push(("body", bbox, nx, ny));
+        // Everything else
+        } else {
+            result.push(("obj", bbox, nx, ny));
         }
     }
-
-    // Hand openness: coefficient of variation of radial distances
-    let variance: f32 = smoothed.iter().map(|d| (d - mean_dist).powi(2)).sum::<f32>() / num_angles as f32;
-    let std_dev = variance.sqrt();
-    let hand_openness = (std_dev / mean_dist).min(1.0);
-
-    // Head tracking: find skin pixels in upper-center region of frame
-    let head_roi_top = 0usize;
-    let head_roi_bottom = (h as f32 * 0.4) as usize;
-    let head_roi_left = (w as f32 * 0.15) as usize;
-    let head_roi_right = (w as f32 * 0.85) as usize;
-    let mut head_total_x = 0.0f32;
-    let mut head_total_y = 0.0f32;
-    let mut head_count = 0.0f32;
-
-    for y in (head_roi_top..head_roi_bottom).step_by(step) {
-        for x in (head_roi_left..head_roi_right).step_by(step) {
-            let i = (y * w + x) * 3;
-            if is_skin(rgb_data[i], rgb_data[i + 1], rgb_data[i + 2]) {
-                // Only count if it's not part of the hand (above the hand)
-                if (y as f32) < cy - (max_y - min_y) * 0.3 {
-                    head_total_x += x as f32;
-                    head_total_y += y as f32;
-                    head_count += 1.0;
-                }
-            }
-        }
-    }
-
-    let has_head = head_count > 5.0;
-    let head_x = if has_head { head_total_x / head_count / w as f32 } else { 0.5 };
-    let head_y = if has_head { head_total_y / head_count / h as f32 } else { 0.5 };
-
-    HandResult {
-        hand_x, hand_y, hand_bbox_size,
-        bbox_px: (min_x as usize, min_y as usize, max_x as usize, max_y as usize),
-        finger_count: finger_count.min(5),
-        hand_openness,
-        head_x, head_y,
-        has_hand: true, has_head,
-    }
+    result
 }
 
 // =========================== Main ===========================
@@ -604,51 +598,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fw = res.width_x as usize;
         let fh = res.height_y as usize;
 
-        // Gesture tracking
-        let hr = track_hand(&rgb, fw, fh);
-        let bbox_px = hr.bbox_px;
+        // Multi-object tracking (find & classify skin blobs)
+        let step = 4usize.max(fw / 80);
+        let blobs = find_blobs(&rgb, fw, fh, step);
+        let objects = classify_blobs(&blobs, fw, fh);
+        let bboxes: Vec<(usize, usize, usize, usize)> = objects.iter().map(|(_, b, _, _)| *b).collect();
 
-        // Map gesture to audio params
+        // Per-object audio mapping
+        let mut hand_bbox = (0, 0, 0, 0);
+        let mut head_nx = 0.5f32;
+        let mut head_ny = 0.5f32;
+        let mut has_hand = false;
+        let mut has_head = false;
+        let mut finger_count = 0usize;
+        let mut body_nx = 0.5f32;
+
+        for (label, bbox, nx, ny) in &objects {
+            let (x1, y1, x2, y2) = bbox;
+            let bw = (x2 - x1) as f32 / fw as f32;
+            let bh = (y2 - y1) as f32 / fh as f32;
+            match *label {
+                "hand"  => { hand_bbox = *bbox; has_hand = true; }
+                "head"  => { head_nx = *nx; head_ny = *ny; has_head = true; }
+                "finger"=> { finger_count += 1; }
+                "body"  => { body_nx = *nx; }
+                _       => {}
+            }
+        }
+
         if let Ok(mut p) = gesture_params.lock() {
-            p.has_hand = hr.has_hand;
-            p.has_head = hr.has_head;
-            p.hand_x = hr.hand_x;
-            p.hand_y = hr.hand_y;
-            p.hand_size = hr.hand_bbox_size;
-            p.finger_count = hr.finger_count as f32;
-            p.hand_openness = hr.hand_openness;
-            p.head_x = hr.head_x;
-            p.head_y = hr.head_y;
+            p.has_hand = has_hand;
+            p.has_head = has_head;
+            p.finger_count = finger_count as f32;
 
-            if hr.has_hand {
-                let hx = hr.hand_x;
-                let hy = hr.hand_y;
-                let hs = hr.hand_bbox_size;
-                let fc = hr.finger_count;
+            if has_hand {
+                let (x1, y1, x2, y2) = hand_bbox;
+                let hx = (x1 + x2) as f32 / (2.0 * fw as f32);
+                let hy = (y1 + y2) as f32 / (2.0 * fh as f32);
+                let hs = ((x2 - x1) * (y2 - y1)) as f32 / (fw * fh) as f32;
 
-                // Fingers → oscillator type & filter type
-                p.osc_type = (fc as f32 / 5.0 * 3.5).floor().clamp(0.0, 3.0);
-                p.filter_type = (fc as f32 / 5.0 * 2.5).floor().clamp(0.0, 2.0);
+                p.hand_x = hx;
+                p.hand_y = hy;
+                p.hand_size = hs.min(1.0);
 
-                // X → pan & detune
+                // Hand X → pan & detune
                 p.pan = hx.clamp(0.0, 1.0);
                 p.detune = 0.99 + hx * 0.06;
-
-                // Y → freq & cutoff
+                // Hand Y → freq & cutoff
                 p.freq = 40.0 + (1.0 - hy) * 1960.0;
                 p.cutoff = 30.0 + (1.0 - hy) * 9970.0;
-
                 // Hand size → gain & modulation
                 p.mod_amt = (hs * 0.6).min(0.5);
                 p.mod_freq = 0.5 + (1.0 - hs) * 29.5;
+                p.gain = (0.04 + hs * 0.5).max(0.04).min(0.9);
 
-                // Head Y → reverb mix (head higher = more reverb)
-                if hr.has_head {
-                    p.reverb_mix = (0.7 - hr.head_y * 0.6).clamp(0.0, 0.7);
-                }
-
-                // Openness → gain (open palm = louder)
-                p.gain = (0.04 + hr.hand_openness * 0.5).max(0.04).min(0.9);
+                // Fingers → oscillator & filter type
+                p.osc_type = ((finger_count as f32) / 5.0 * 3.5).floor().clamp(0.0, 3.0);
+                p.filter_type = ((finger_count as f32) / 5.0 * 2.5).floor().clamp(0.0, 2.0);
+            }
+            if has_head {
+                p.head_x = head_nx;
+                p.head_y = head_ny;
+                p.reverb_mix = (0.7 - head_ny * 0.6).clamp(0.0, 0.7);
             }
         }
 
@@ -663,8 +674,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if rows > info_rows + 5 {
                 let ascii_rows = rows - info_rows;
                 let (mut text, mut colors) = build_ascii_frame(&rgb, fw, fh, cols, ascii_rows, use_color);
-                if hr.has_hand {
-                    overlay_bbox(&mut text, &mut colors, fw, fh, bbox_px, cols, ascii_rows);
+                // Draw all detected object bounding boxes (each with different color)
+                let bbox_colors = [(0,255,0),(255,0,0),(0,255,255),(255,255,0),(255,128,0)];
+                for (idx, &(ref label, bbox, _, _)) in objects.iter().enumerate() {
+                    let col = bbox_colors[idx % bbox_colors.len()];
+                    overlay_bbox_color(&mut text, &mut colors, fw, fh, bbox, cols, ascii_rows, col, label);
                 }
 
                 if let Err(e) = terminal.draw(|f| {
@@ -680,7 +694,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let flt_names = ["LPF", "BPF", "HPF"];
                     let oidx = gs.osc_type as usize;
                     let fidx = gs.filter_type as usize;
-                    let stat = if gs.has_hand { "HAND" } else { "--" };
+                    let stat = if gs.has_hand { "HAND" } else if gs.has_head { "FACE" } else { "--" };
+                    let fc = gs.finger_count as usize;
                     let hd = if gs.has_head { format!("Hd{:.2}", gs.head_y) } else { "---".to_string() };
 
                     let chunks = Layout::default()
@@ -690,10 +705,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Row 0: status
                     let status_line = format!(
-                        " {}  {}:{}  {}F  {}  Open:{:.2}  Pan:{:.2}  [q]uit [c]olor({})",
+                        " {}  {}:{}  {}F  {}  Pan:{:.2}  [q]uit [c]olor({})",
                         stat, osc_names[oidx.min(3)], flt_names[fidx.min(2)],
-                        gs.finger_count as usize, hd, gs.hand_openness, gs.pan,
-                        if use_color { "on" } else { "off" }
+                        fc, hd, gs.pan,
+                        if use_color { "on" } else { "off" },
                     );
                     let block = Block::default().borders(Borders::TOP).title("Synth");
                     f.render_widget(Paragraph::new(status_line).block(block), chunks[0]);
