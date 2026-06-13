@@ -21,10 +21,10 @@ select_osc(f, t) = select2(t > 0,
         saw_osc(f)),
     os.osc(f));
 
-carrier = select_osc(freq + os.osc(mod_freq) * mod_amt * freq * 0.8, osc_type);
-sub     = select_osc(freq * 0.5, osc_type) * 0.35;
-detuned = select_osc(freq * detune, osc_type) * 0.45;
-mix = carrier + sub + detuned + no.noise * 0.08;
+carrier = select_osc(freq + os.osc(mod_freq) * mod_amt * freq * 0.5, osc_type);
+sub     = select_osc(freq * 0.5, osc_type) * 0.25;
+detuned = select_osc(freq * detune, osc_type) * 0.3;
+mix = carrier + sub + detuned + no.noise * 0.04;
 
 // Filter selection using only lowpass & highpass (both work correctly)
 lpf = fi.lowpass(3, cutoff, mix);
@@ -36,7 +36,7 @@ sbpf = (ft > 0.0) - (ft > 1.0);
 shpf = (ft > 1.0) - (ft > 2.0);
 filtered = lpf * slpf + bpf * sbpf + hpf * shpf;
 
-rev = re.mono_freeverb(0.7, 0.5, 0.4, 23);
+rev = re.mono_freeverb(0.5, 0.3, 0.3, 23);
 wet = reverb_mix * (filtered : rev);
 dry = (1.0 - reverb_mix) * filtered;
 out = (dry + wet) * gain;

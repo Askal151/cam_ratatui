@@ -16,9 +16,9 @@ use nokhwa::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::Rect,
-    style::Color,
-    widgets::{Block, Borders, Paragraph, Widget},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    widgets::{Block, Borders, Gauge, Paragraph, Widget},
     Terminal,
 };
 
@@ -617,7 +617,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rows = rows as usize;
 
         if cols > 0 && rows > 0 {
-            let info_rows = 3usize;
+            let info_rows = 4usize;
             if rows > info_rows + 5 {
                 let ascii_rows = rows - info_rows;
                 let (text, colors) = build_ascii_frame(&rgb, fw, fh, cols, ascii_rows, use_color);
@@ -627,30 +627,105 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let ascii_area = Rect::new(0, 0, area.width, area.height - info_rows as u16);
                     f.render_widget(AsciiWidget { text, colors }, ascii_area);
 
-                    // Info overlay
+                    // Parameter box overlay
+                    let info_rows = 4usize;
                     let info_area = Rect::new(0, area.height - info_rows as u16, area.width, info_rows as u16);
                     let gs = gesture_params.lock().unwrap();
-                    let status = if gs.has_hand { "HAND" } else { "NONE" };
-                    let osc_names = ["Sine", "Saw", "Sqre", "Tri "];
+                    let osc_names = ["Sin", "Saw", "Sq ", "Tri"];
                     let flt_names = ["LPF", "BPF", "HPF"];
                     let oidx = gs.osc_type as usize;
                     let fidx = gs.filter_type as usize;
-                    let fc = gs.finger_count as usize;
-                    let open_bar = "░".repeat((gs.hand_openness * 8.0) as usize);
-                    let info = format!(
-                        " {} | {}:{}F {:.0}Hz/{:.0}ct | G:{:.2} M:{:.2}/{:.1} D:{:.3} R:{:.2} | P:{:.2}\n\
-                         Fingers:{} | Open:{} ({:.2}) | Head:{:.2},{:.2} | [q]uit [c]olor({})",
-                        status,
-                        osc_names[oidx.min(3)], flt_names[fidx.min(2)],
-                        gs.freq, gs.cutoff, gs.gain,
-                        gs.mod_amt, gs.mod_freq, gs.detune, gs.reverb_mix,
-                        gs.pan,
-                        fc, open_bar, gs.hand_openness,
-                        gs.head_x, gs.head_y,
+                    let stat = if gs.has_hand { "HAND" } else { "--" };
+                    let hd = if gs.has_head { format!("Hd{:.2}", gs.head_y) } else { "---".to_string() };
+
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)].as_ref())
+                        .split(info_area);
+
+                    // Row 0: status
+                    let status_line = format!(
+                        " {}  {}:{}  {}F  {}  Open:{:.2}  Pan:{:.2}  [q]uit [c]olor({})",
+                        stat, osc_names[oidx.min(3)], flt_names[fidx.min(2)],
+                        gs.finger_count as usize, hd, gs.hand_openness, gs.pan,
                         if use_color { "on" } else { "off" }
                     );
                     let block = Block::default().borders(Borders::TOP).title("Synth");
-                    f.render_widget(Paragraph::new(info).block(block), info_area);
+                    f.render_widget(Paragraph::new(status_line).block(block), chunks[0]);
+
+                    // Rows 1-3: parameter bars in 2 columns
+                    let bar_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                        .split(chunks[1]);
+
+                    let freq_norm = ((gs.freq - 40.0) / 1960.0).clamp(0.0, 1.0);
+                    let cut_norm = ((gs.cutoff - 30.0) / 9970.0).clamp(0.0, 1.0);
+                    let gain_norm = gs.gain;
+                    let mod_norm = gs.mod_amt / 0.5;
+                    let rev_norm = gs.reverb_mix / 0.7;
+                    let det_norm = ((gs.detune - 0.99) / 0.06).clamp(0.0, 1.0);
+
+                    f.render_widget(
+                        Gauge::default()
+                            .block(Block::default().borders(Borders::NONE))
+                            .gauge_style(Style::default().fg(Color::Cyan))
+                            .percent((freq_norm * 100.0) as u16)
+                            .label(format!("Freq {:.0}Hz", gs.freq)),
+                        bar_chunks[0],
+                    );
+                    f.render_widget(
+                        Gauge::default()
+                            .block(Block::default().borders(Borders::NONE))
+                            .gauge_style(Style::default().fg(Color::Magenta))
+                            .percent((cut_norm * 100.0) as u16)
+                            .label(format!("Cut {:.0}Hz", gs.cutoff)),
+                        bar_chunks[1],
+                    );
+
+                    let bar_chunks2 = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                        .split(chunks[2]);
+
+                    f.render_widget(
+                        Gauge::default()
+                            .block(Block::default().borders(Borders::NONE))
+                            .gauge_style(Style::default().fg(Color::Green))
+                            .percent((gain_norm * 100.0) as u16)
+                            .label(format!("Gain {:.2}", gs.gain)),
+                        bar_chunks2[0],
+                    );
+                    f.render_widget(
+                        Gauge::default()
+                            .block(Block::default().borders(Borders::NONE))
+                            .gauge_style(Style::default().fg(Color::Yellow))
+                            .percent((mod_norm * 100.0) as u16)
+                            .label(format!("Mod {:.2}", gs.mod_amt)),
+                        bar_chunks2[1],
+                    );
+
+                    let bar_chunks3 = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                        .split(chunks[3]);
+
+                    f.render_widget(
+                        Gauge::default()
+                            .block(Block::default().borders(Borders::NONE))
+                            .gauge_style(Style::default().fg(Color::Red))
+                            .percent((rev_norm * 100.0) as u16)
+                            .label(format!("Rev {:.2}", gs.reverb_mix)),
+                        bar_chunks3[0],
+                    );
+                    f.render_widget(
+                        Gauge::default()
+                            .block(Block::default().borders(Borders::NONE))
+                            .gauge_style(Style::default().fg(Color::Blue))
+                            .percent((det_norm * 100.0) as u16)
+                            .label(format!("Det {:.3}", gs.detune)),
+                        bar_chunks3[1],
+                    );
                 }) {
                     break Err(Box::new(e));
                 }
