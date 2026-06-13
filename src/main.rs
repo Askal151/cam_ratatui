@@ -105,6 +105,10 @@ pub struct GestureParams {
     pub detune: f32,
     pub filter_type: f32,
     pub reverb_mix: f32,
+    pub grain_rate: f32,
+    pub grain_size: f32,
+    pub grain_amt: f32,
+    pub grain_scat: f32,
     pub hand_x: f32,
     pub hand_y: f32,
     pub hand_size: f32,
@@ -129,6 +133,10 @@ impl Default for GestureParams {
             detune: 1.001,
             filter_type: 0.0,
             reverb_mix: 0.15,
+            grain_rate: 4.0,
+            grain_size: 0.12,
+            grain_amt: 0.3,
+            grain_scat: 0.2,
             hand_x: 0.5,
             hand_y: 0.5,
             hand_size: 0.1,
@@ -142,18 +150,134 @@ impl Default for GestureParams {
     }
 }
 
+// =========================== Sampler / Recorder ===========================
+
+const MAX_SAMPLE_LEN: usize = 44100 * 10; // 10 seconds max
+
+#[derive(Clone)]
+struct SamplerState {
+    sample: Vec<f32>,
+    recording: bool,
+    has_sample: bool,
+}
+
+impl SamplerState {
+    fn new() -> Self {
+        Self { sample: Vec::with_capacity(MAX_SAMPLE_LEN), recording: false, has_sample: false }
+    }
+}
+
+struct GranularSampler {
+    state: Arc<Mutex<SamplerState>>,
+    params: Arc<Mutex<GestureParams>>,
+    grain_phase: f32,
+    rng_state: u32,
+    sample_rate: f32,
+    hann: Vec<f32>,
+}
+
+impl GranularSampler {
+    fn new(state: Arc<Mutex<SamplerState>>, params: Arc<Mutex<GestureParams>>, sr: f32) -> Self {
+        // Precompute Hann window (512 samples)
+        let mut hann = vec![0.0f32; 512];
+        for i in 0..512 {
+            let p = (i as f32) / 511.0;
+            hann[i] = (p * std::f32::consts::PI).sin().powi(2);
+        }
+        Self { state, params, grain_phase: 0.0, rng_state: 12345, sample_rate: sr, hann }
+    }
+
+    fn rng(&mut self) -> f32 {
+        self.rng_state = self.rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+        (self.rng_state as f32) / 4294967296.0
+    }
+
+    fn process(&mut self, output: &mut [f32], channels: usize, synth_out: &[f32]) {
+        let (has_sample, sample_clone) = {
+            let st = self.state.lock().unwrap();
+            (st.has_sample && !st.sample.is_empty(), st.sample.clone())
+        };
+        if !has_sample {
+            for i in 0..output.len() {
+                output[i] = synth_out[i];
+            }
+            return;
+        }
+        let sample = &sample_clone;
+        let sample_len = sample.len() as f32;
+
+        let (speed, grain_rate, grain_size_v, grain_amp_v, base_pos, scatter) = {
+            let p = self.params.lock().unwrap();
+            (
+                (0.25 + p.finger_count / 5.0 * 1.75).max(0.1).min(4.0),
+                if p.has_hand { 2.0 + p.hand_y * 18.0 } else { 4.0 },
+                if p.has_hand { (0.02 + p.hand_size * 0.48).max(0.01).min(0.5) } else { 0.12 },
+                if p.has_hand { (0.1 + p.hand_size * 0.6).min(1.0) } else { 0.3 },
+                if p.has_hand { p.hand_x.clamp(0.0, 1.0) } else { 0.5 },
+                if p.has_hand { (0.1 + (1.0 - p.hand_size) * 0.4).min(0.5) } else { 0.2 },
+            )
+        };
+
+        let sr = self.sample_rate;
+        let grain_period = sr / grain_rate.max(0.5);
+        let grain_len = (sr * grain_size_v).max(1.0) as usize;
+        let num_frames = output.len() / channels;
+
+        for i in 0..num_frames {
+            self.grain_phase += 1.0;
+            let grain_start = self.grain_phase >= grain_period;
+            if grain_start {
+                self.grain_phase -= grain_period;
+            }
+
+            if grain_start {
+                let _offset = self.rng() * scatter * sample_len;
+                let _pos = (base_pos * sample_len + _offset) % sample_len;
+                self.rng_state = self.rng_state.wrapping_add(12345);
+            }
+
+            let grain_pos = (self.grain_phase / grain_period * grain_len as f32) as usize;
+            let mut g_amp = 0.0f32;
+            let mut g_samp = 0.0f32;
+
+            if grain_pos < grain_len {
+                let env_idx = ((grain_pos as f32 / grain_len.max(1) as f32) * 511.0) as usize;
+                let env = self.hann[env_idx.min(511)];
+                g_amp = env * grain_amp_v;
+
+                let read_pos = (self.rng_state as f32 / 4294967296.0 * sample_len * 0.5) % sample_len;
+                let base_read = read_pos + grain_pos as f32 * speed;
+                let idx = base_read as usize % sample.len();
+                let frac = base_read - idx as f32;
+                let next = (idx + 1) % sample.len();
+                g_samp = sample[idx] * (1.0 - frac) + sample[next] * frac;
+            }
+
+            if channels == 2 {
+                let pan = self.rng();
+                output[i * 2] = synth_out[i * 2] + g_samp * g_amp * (1.0 - pan * 0.5);
+                output[i * 2 + 1] = synth_out[i * 2 + 1] + g_samp * g_amp * pan * 0.5;
+            } else {
+                output[i] = synth_out[i] + g_samp * g_amp * 0.3;
+            }
+        }
+    }
+}
+
 // =========================== Audio engine ===========================
 
 struct AudioEngine {
     dsp: faust_gen::mydsp,
     params: Arc<Mutex<GestureParams>>,
+    sampler: GranularSampler,
 }
 
 impl AudioEngine {
-    fn new(params: Arc<Mutex<GestureParams>>) -> Self {
+    fn new(params: Arc<Mutex<GestureParams>>, sampler_state: Arc<Mutex<SamplerState>>) -> Self {
         let mut dsp = faust_gen::mydsp::new();
         dsp.init(44100);
-        Self { dsp, params }
+        let sampler = GranularSampler::new(sampler_state, params.clone(), 44100.0);
+        Self { dsp, params, sampler }
     }
 
     fn process(&mut self, output: &mut [f32], channels: usize) {
@@ -163,11 +287,15 @@ impl AudioEngine {
             self.dsp.set_param(ParamIndex(2), params.filter_type);
             self.dsp.set_param(ParamIndex(3), params.freq);
             self.dsp.set_param(ParamIndex(4), params.gain);
-            self.dsp.set_param(ParamIndex(5), params.mod_amt);
-            self.dsp.set_param(ParamIndex(6), params.mod_freq);
-            self.dsp.set_param(ParamIndex(7), params.osc_type);
-            self.dsp.set_param(ParamIndex(8), params.pan);
-            self.dsp.set_param(ParamIndex(9), params.reverb_mix);
+            self.dsp.set_param(ParamIndex(5), params.grain_amt);
+            self.dsp.set_param(ParamIndex(6), params.grain_rate);
+            self.dsp.set_param(ParamIndex(7), params.grain_scat);
+            self.dsp.set_param(ParamIndex(8), params.grain_size);
+            self.dsp.set_param(ParamIndex(9), params.mod_amt);
+            self.dsp.set_param(ParamIndex(10), params.mod_freq);
+            self.dsp.set_param(ParamIndex(11), params.osc_type);
+            self.dsp.set_param(ParamIndex(12), params.pan);
+            self.dsp.set_param(ParamIndex(13), params.reverb_mix);
         }
 
         let num_frames = output.len() / channels;
@@ -176,19 +304,41 @@ impl AudioEngine {
         let outputs = &mut [left_out.as_mut_slice(), right_out.as_mut_slice()];
         self.dsp.compute(num_frames as i32, &[], outputs);
 
+        // Interleave synth output
+        let mut synth_out = vec![0.0f32; output.len()];
         for i in 0..num_frames {
             if channels == 2 {
-                output[i * 2] = left_out[i];
-                output[i * 2 + 1] = right_out[i];
+                synth_out[i * 2] = left_out[i];
+                synth_out[i * 2 + 1] = right_out[i];
             } else {
-                output[i] = left_out[i];
+                synth_out[i] = left_out[i];
             }
         }
+
+        // Record to sampler if recording
+        {
+            let mut st = self.sampler.state.lock().unwrap();
+            if st.recording && st.sample.len() < MAX_SAMPLE_LEN {
+                // Record mono mix of synth
+                for i in 0..num_frames {
+                    let s = if channels == 2 {
+                        (synth_out[i * 2] + synth_out[i * 2 + 1]) * 0.5
+                    } else {
+                        synth_out[i]
+                    };
+                    st.sample.push(s);
+                }
+            }
+        }
+
+        // Mix in granular sampler
+        self.sampler.process(output, channels, &synth_out);
     }
 }
 
 fn start_audio(
     params: Arc<Mutex<GestureParams>>,
+    sampler_state: Arc<Mutex<SamplerState>>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
     let device = host
@@ -205,8 +355,9 @@ fn start_audio(
         device.name().unwrap_or_default()
     );
 
-    let mut engine = AudioEngine::new(params);
+    let mut engine = AudioEngine::new(params, sampler_state);
     engine.dsp.init(sample_rate as i32);
+    engine.sampler.sample_rate = sample_rate as f32;
 
     let stream = device.build_output_stream(
         &config.into(),
@@ -573,7 +724,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     camera.open_stream()?;
 
     let gesture_params = Arc::new(Mutex::new(GestureParams::default()));
-    let _audio_stream = start_audio(gesture_params.clone())?;
+    let sampler_state = Arc::new(Mutex::new(SamplerState::new()));
+    let _audio_stream = start_audio(gesture_params.clone(), sampler_state.clone())?;
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -655,6 +807,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // ---- Hand X → pan (full range) ----
                 p.pan = hx.clamp(0.0, 1.0);
 
+                // ---- Hand Y inverted → grain_rate (down=fast, up=slow) ----
+                p.grain_rate = 0.5 + (1.0 - hy) * 19.5;
+
                 // ---- Velocity → detune wobble (speed = pitch shimmy) ----
                 p.detune = 1.0 + v_boost * 0.04;
 
@@ -662,28 +817,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 p.freq = 40.0 + (1.0 - hy) * 1960.0;
                 p.cutoff = 30.0 + (1.0 - hy) * 9970.0;
 
-                // ---- Hand size → gain & modulation ----
+                // ---- Hand size → gain, modulation & grain_size ----
                 p.mod_amt = ((1.0 - hs) * 0.6).min(0.5);
                 p.mod_freq = 0.5 + hs * 29.5;
                 p.gain = (0.04 + hs * 0.8).max(0.04).min(0.9);
+                p.grain_size = (0.01 + hs * 0.49).max(0.01).min(0.5);
 
-                // ---- Velocity → gain burst + mod sweep ----
+                // ---- Velocity → gain burst + mod sweep + granular spike ----
                 if vel > 0.05 {
                     p.gain = (p.gain + v_boost * 0.3).min(0.9);
                     p.mod_freq = (p.mod_freq + v_boost * 30.0).min(30.0);
                     p.mod_amt = (p.mod_amt + v_boost * 0.3).min(0.6);
+                    p.grain_rate = (p.grain_rate + v_boost * 15.0).min(20.0);
+                    p.grain_scat = (p.grain_scat + v_boost * 0.5).min(1.0);
                     // Direction: moving up = pitch sweep
                     if dy < 0.0 {
                         p.freq = (p.freq + v_boost * 500.0).min(2000.0);
                     }
                 }
 
-                // ---- Fingers → osc & filter combos ----
+                // ---- Fingers → osc, filter, & granular combos ----
                 let fc = finger_count.min(5);
                 let osc_table = [0.0, 1.0, 0.0, 2.0, 3.0, 2.0];
                 let flt_table = [0.0, 0.0, 1.0, 1.0, 2.0, 2.0];
+                let grain_table = [0.0, 0.1, 0.3, 0.5, 0.7, 1.0];
+                let scat_table = [0.0, 0.1, 0.2, 0.4, 0.6, 1.0];
                 p.osc_type = osc_table[fc];
                 p.filter_type = flt_table[fc];
+                p.grain_amt = grain_table[fc];
+                p.grain_scat = scat_table[fc];
 
                 // ---- Head → reverb mix ----
                 if has_head {
@@ -696,6 +858,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 p.gain = 0.0;
                 p.mod_freq = 1.0;
                 p.detune = 1.0;
+                p.grain_amt = 0.0;
+                p.grain_scat = 0.0;
                 prev_hx = 0.5;
                 prev_hy = 0.5;
 
@@ -742,6 +906,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let stat = if gs.has_hand { "HAND" } else if gs.has_head { "FACE" } else { "--" };
                     let fc = gs.finger_count as usize;
                     let hd = if gs.has_head { format!("Hd{:.2}", gs.head_y) } else { "---".to_string() };
+                    let rec_status = {
+                        let st = sampler_state.lock().unwrap();
+                        if st.recording { "REC" } else if st.has_sample { "SAMP" } else { "---" }
+                    };
 
                     let chunks = Layout::default()
                         .direction(Direction::Vertical)
@@ -750,9 +918,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Row 0: status
                     let status_line = format!(
-                        " {}  {}:{}  {}F  {}  Pan:{:.2}  [q]uit [c]olor({})",
+                        " {}  {}:{}  {}F  {}  Pan:{:.2}  {}  [q]uit [c]olor({})",
                         stat, osc_names[oidx.min(3)], flt_names[fidx.min(2)],
-                        fc, hd, gs.pan,
+                        fc, hd, gs.pan, rec_status,
                         if use_color { "on" } else { "off" },
                     );
                     let block = Block::default().borders(Borders::TOP).title("Synth");
@@ -842,6 +1010,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match key.code {
                     KeyCode::Char('q') => break Ok(()),
                     KeyCode::Char('c') => use_color = !use_color,
+                    KeyCode::Char(' ') => {
+                        let mut st = sampler_state.lock().unwrap();
+                        if st.recording {
+                            st.recording = false;
+                            st.has_sample = !st.sample.is_empty();
+                        } else {
+                            st.sample.clear();
+                            st.recording = true;
+                        }
+                    }
                     _ => {}
                 }
             }

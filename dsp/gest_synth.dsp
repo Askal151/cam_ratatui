@@ -11,6 +11,11 @@ detune      = hslider("detune", 1.001, 0.99, 1.05, 0.001);
 filter_type = hslider("filter_type", 0, 0, 2, 1);
 reverb_mix  = hslider("reverb_mix", 0.15, 0, 0.8, 0.01);
 
+grain_rate  = hslider("grain_rate", 4, 0.5, 20, 0.1);
+grain_size  = hslider("grain_size", 0.12, 0.01, 0.5, 0.01);
+grain_amt   = hslider("grain_amt", 0.3, 0, 1, 0.01);
+grain_scat  = hslider("grain_scat", 0.2, 0, 1, 0.01);
+
 saw_osc=os.sawtooth;
 tri_osc=os.triangle;
 sqr_osc=os.square;
@@ -26,7 +31,6 @@ sub     = select_osc(freq * 0.5, osc_type) * 0.25;
 detuned = select_osc(freq * detune, osc_type) * 0.3;
 mix = carrier + sub + detuned + no.noise * 0.04;
 
-// Filter selection using only lowpass & highpass (both work correctly)
 lpf = fi.lowpass(3, cutoff, mix);
 hpf = fi.highpass(2, cutoff, mix);
 bpf = fi.highpass(2, cutoff, fi.lowpass(2, cutoff * 1.4, mix));
@@ -41,4 +45,17 @@ wet = reverb_mix * (filtered : rev);
 dry = (1.0 - reverb_mix) * filtered;
 out = (dry + wet) * gain;
 
-process = out * pan, out * (1.0 - pan);
+// Granular section
+grain_phase = os.phasor(grain_rate);
+grain_size_norm = grain_size * grain_rate;
+grain_size_clamped = min(grain_size_norm, 1.0);
+grain_active = grain_phase < grain_size_clamped;
+grain_pos = grain_phase / max(grain_size_clamped, 0.001);
+grain_env = select2(grain_active, pow(sin(grain_pos * 3.14159), 2), 0.0);
+amp_jitter = 1.0 + grain_scat * no.noise * 0.6;
+pan_jitter = (no.noise + 1.0) * 0.5;
+grain_wet = out * grain_env * amp_jitter * grain_amt;
+grain_L = grain_wet * pan_jitter;
+grain_R = grain_wet * (1.0 - pan_jitter);
+
+process = (out * pan + grain_L), (out * (1.0 - pan) + grain_R);
