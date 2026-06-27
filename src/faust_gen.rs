@@ -155,6 +155,13 @@ pub struct mydsp {
 	fHslider13: F32,
 	fRec49: [F32;2],
 	fRec50: [F32;2],
+	pub sample_buffer: Vec<f32>,
+	pub sample_pos: f32,
+	pub sample_amp: f32,
+	pub sample_pitch: f32,
+	pub korg_drive: F32,
+	pub korg_ring: F32,
+	pub korg_sync: F32,
 }
 
 impl FaustDsp for mydsp {
@@ -262,6 +269,13 @@ impl FaustDsp for mydsp {
 			fHslider13: 0.0,
 			fRec49: [0.0;2],
 			fRec50: [0.0;2],
+			sample_buffer: Vec::new(),
+			sample_pos: 0.0,
+			sample_amp: 0.0,
+			sample_pitch: 1.0,
+			korg_drive: 0.0,
+			korg_ring: 0.0,
+			korg_sync: 0.0,
 		}
 	}
 	fn metadata(&self, m: &mut dyn Meta) { 
@@ -332,7 +346,7 @@ impl FaustDsp for mydsp {
 		return self.fSampleRate;
 	}
 	fn get_num_inputs(&self) -> i32 {
-		return 4;
+		return 0;
 	}
 	fn get_num_outputs(&self) -> i32 {
 		return 2;
@@ -803,7 +817,7 @@ impl FaustDsp for mydsp {
 			let mut fRec17: F32 = if iTemp33 != 0 {fTemp34} else {fSlow46 + self.fRec16[1] + fSlow47 * fTemp32};
 			let mut fTemp35: F32 = if iTemp1 != 0 {0.0} else {fSlow48 + self.fRec18[1]};
 			self.fRec18[0] = fTemp35 - F32::floor(fTemp35);
-			let mut fTemp36: F32 = 0.3 * if iSlow9 != 0 {unsafe { ftbl0mydspSIG0[(std::cmp::max(0, std::cmp::min((65536.0 * self.fRec18[0]) as i32, 65535))) as usize] }} else {if iSlow10 != 0 {2.0 * fRec17 + -1.0} else {if iSlow11 != 0 {fTemp30 - fTemp31} else {fSlow44 * self.fRec14[0]}}} + 0.25 * if iSlow9 != 0 {unsafe { ftbl0mydspSIG0[(std::cmp::max(0, std::cmp::min((65536.0 * self.fRec13[0]) as i32, 65535))) as usize] }} else {if iSlow10 != 0 {2.0 * fRec12 + -1.0} else {if iSlow11 != 0 {fTemp22 - fTemp23} else {fSlow28 * self.fRec9[0]}}} + if iSlow9 != 0 {unsafe { ftbl0mydspSIG0[(std::cmp::max(0, std::cmp::min((65536.0 * self.fRec8[0]) as i32, 65535))) as usize] }} else {if iSlow10 != 0 {2.0 * fRec7 + -1.0} else {if iSlow11 != 0 {fTemp14} else {fSlow15 * self.fRec4[0] * fTemp3}}} + 1.8626451e-11 * fTemp0;
+			let mut fTemp36: F32 = if iSlow9 != 0 {unsafe { ftbl0mydspSIG0[(std::cmp::max(0, std::cmp::min((65536.0 * self.fRec18[0]) as i32, 65535))) as usize] }} else {if iSlow10 != 0 {2.0 * fRec17 + -1.0} else {if iSlow11 != 0 {fTemp30 - fTemp31} else {fSlow44 * self.fRec14[0]}}} * 0.12 + 0.15 * if iSlow9 != 0 {unsafe { ftbl0mydspSIG0[(std::cmp::max(0, std::cmp::min((65536.0 * self.fRec13[0]) as i32, 65535))) as usize] }} else {if iSlow10 != 0 {2.0 * fRec12 + -1.0} else {if iSlow11 != 0 {fTemp22 - fTemp23} else {fSlow28 * self.fRec9[0]}}} + if iSlow9 != 0 {unsafe { ftbl0mydspSIG0[(std::cmp::max(0, std::cmp::min((65536.0 * self.fRec8[0]) as i32, 65535))) as usize] }} else {if iSlow10 != 0 {2.0 * fRec7 + -1.0} else {if iSlow11 != 0 {fTemp14} else {fSlow15 * self.fRec4[0] * fTemp3}}};
 			self.fVec8[0] = fTemp36;
 			self.fRec0[0] = fTemp36 - fSlow7 * (fSlow5 * self.fRec0[2] + fSlow3 * self.fRec0[1]);
 			let mut fTemp37: F32 = 2.0 * self.fRec0[1];
@@ -867,6 +881,25 @@ impl FaustDsp for mydsp {
 			let mut fTemp51: F32 = if iTemp1 != 0 {0.0} else {self.fRec50[1] + self.fConst2 * *input3};
 			self.fRec50[0] = fTemp51 - F32::floor(fTemp51);
 			*output1 = fSlow75 * fTemp45 * (fSlow72 * fTemp47 * if ((fSlow69 * self.fRec49[0]) < fSlow70) as i32 != 0 {0.0} else {mydsp_faustpower2_f(F32::sin(fSlow71 * self.fRec50[0]))} * (1.0 - 0.5 * fTemp46) + 1.0 - fSlow74);
+			if self.sample_amp > 0.0 && !self.sample_buffer.is_empty() {
+				let sample_len = self.sample_buffer.len() as f32;
+				let pos = self.sample_pos;
+				if pos >= 0.0 && pos < sample_len {
+					let idx = pos as usize;
+					let frac = pos - idx as f32;
+					let next_idx = if idx + 1 < self.sample_buffer.len() { idx + 1 } else { 0 };
+					let s = self.sample_buffer[idx] + frac * (self.sample_buffer[next_idx] - self.sample_buffer[idx]);
+					*output0 += s * self.sample_amp;
+					*output1 += s * self.sample_amp;
+				}
+				self.sample_pos += self.sample_pitch;
+				if self.sample_pos >= sample_len {
+					self.sample_pos -= sample_len;
+				}
+				if self.sample_pos < 0.0 { self.sample_pos = 0.0; }
+			}
+			if *output0 > 0.95 { *output0 = 0.95; } else if *output0 < -0.95 { *output0 = -0.95; }
+			if *output1 > 0.95 { *output1 = 0.95; } else if *output1 < -0.95 { *output1 = -0.95; }
 			self.iVec0[1] = self.iVec0[0];
 			self.iRec1[1] = self.iRec1[0];
 			self.fRec3[1] = self.fRec3[0];
