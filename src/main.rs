@@ -133,7 +133,7 @@ impl Default for GestureParams {
             freq: 440.0,
             cutoff: 2000.0,
             gain: 0.3,
-            mod_amt: 0.05,
+            mod_amt: 0.0,
             mod_freq: 3.0,
             osc_type: 0.0,
             pan: 0.5,
@@ -178,6 +178,7 @@ struct SamplerState {
     has_sample: bool,
     sample_version: u64,
 }
+
 impl SamplerState {
     fn new() -> Self {
         Self {
@@ -198,8 +199,7 @@ impl SamplerState {
         }
         let max_len = self.layers.iter().map(|l| l.buffer.len()).max().unwrap_or(0);
         let mut out = vec![0.0f32; max_len];
-        let n = self.layers.len() as f32;
-        let g = 1.0 / n;
+        let g = 1.0 / self.layers.len() as f32;
         for layer in &self.layers {
             for (i, &s) in layer.buffer.iter().enumerate() {
                 out[i] += s * g;
@@ -310,7 +310,7 @@ impl AudioEngine {
         let d = GestureParams::default();
         Self {
             dsp, cacher: params, sampler, mic_buffer, mic_channels, cached: GestureParams::default(), delay,
-            smooth_freq: d.freq, smooth_cutoff: d.cutoff, smooth_pan: d.pan, smooth_gain: d.gain,
+            smooth_freq: d.freq, smooth_cutoff: d.cutoff, smooth_pan: d.pan, smooth_gain: 0.0,
             smooth_reverb: d.reverb_mix, smooth_mod_freq: d.mod_freq, smooth_mod_amt: d.mod_amt,
             smooth_detune: d.detune, smooth_rate: d.grain_rate, smooth_grain_amt: d.grain_amt,
             smooth_grain_scat: d.grain_scat, last_sample_version: 0,
@@ -360,6 +360,18 @@ impl AudioEngine {
 
         let num_frames = output.len() / channels;
 
+        self.dsp_left.resize(num_frames, 0.0);
+        self.dsp_right.resize(num_frames, 0.0);
+        self.dsp_input.resize(num_frames, 0.0);
+        let outputs = &mut [self.dsp_left.as_mut_slice(), self.dsp_right.as_mut_slice()];
+        let inputs: [&[f32]; 4] = [&self.dsp_input, &self.dsp_input, &self.dsp_input, &self.dsp_input];
+        self.dsp.compute(num_frames as i32, &inputs, outputs);
+
+        // Apply delay only while synth is active — prevents echo tail sustaining after gesture ends
+        if self.smooth_gain > 0.002 {
+            self.delay.process(&mut self.dsp_left, &mut self.dsp_right, p.head_x * 0.8 + 0.1, p.head_y * 0.55 + 0.05, 0.35, 44100.0);
+        }
+
         // Record mic input (non-blocking) — fills the sample buffer
         if let Ok(mut st) = self.sampler.state.try_lock() {
             if st.recording && st.sample.len() < MAX_SAMPLE_LEN {
@@ -390,24 +402,14 @@ impl AudioEngine {
                     self.dsp.sample_buffer = st.mixed_buffer.clone();
                     self.last_sample_version = st.sample_version;
                 }
-                self.dsp.sample_amp = (p.gain * 2.5 + 0.3).min(1.5);
+                self.dsp.sample_amp = (p.gain * 2.5).min(1.5);
                 self.dsp.sample_pitch = if p.has_hand { 0.5 + p.finger_count * 0.8 } else { 1.0 };
             } else {
                 self.dsp.sample_amp = 0.0;
             }
         }
 
-        self.dsp_left.resize(num_frames, 0.0);
-        self.dsp_right.resize(num_frames, 0.0);
-        self.dsp_input.resize(num_frames, 0.0);
-        let outputs = &mut [self.dsp_left.as_mut_slice(), self.dsp_right.as_mut_slice()];
-        let inputs: [&[f32]; 4] = [&self.dsp_input, &self.dsp_input, &self.dsp_input, &self.dsp_input];
-        self.dsp.compute(num_frames as i32, &inputs, outputs);
-
-        // Apply delay to everything (synth + sample combined)
-        self.delay.process(&mut self.dsp_left, &mut self.dsp_right, p.head_x * 0.8 + 0.1, p.head_y * 0.55 + 0.05, 0.35, 44100.0);
-
-        // Copy to audio output
+        // Copy DSP to output
         for i in 0..num_frames {
             if channels == 2 {
                 output[i * 2] = self.dsp_left[i];
@@ -765,6 +767,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_hy = 0.5f32;
     let mut hand_hold = 0.0f32;
     let mut cam_errors = 0u32;
+    let mut last_good_frame = Instant::now();
+    const CAM_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+    const CAM_RESTART_EVERY: u32 = 30;
 
     let result = loop {
         let frame_start = Instant::now();
@@ -772,14 +777,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let buffer = match camera.frame() {
             Ok(b) => {
                 cam_errors = 0;
+                last_good_frame = frame_start;
                 b
             }
             Err(e) => {
                 cam_errors += 1;
                 eprintln!("camera frame error #{}: {}", cam_errors, e);
-                if cam_errors > 30 {
+
+                // Transient failures (e.g. system briefly overloaded) can produce
+                // bursts of errors; only give up once the camera has been silent
+                // for a while, and try restarting the stream before then.
+                if cam_errors % CAM_RESTART_EVERY == 0 {
+                    eprintln!("camera stalled for {} errors, attempting to restart stream", cam_errors);
+                    if let Err(re) = camera.open_stream() {
+                        eprintln!("camera restart failed: {}", re);
+                    }
+                }
+                if last_good_frame.elapsed() > CAM_STALL_TIMEOUT {
                     break Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "camera disconnected")) as Box<dyn std::error::Error>);
                 }
+
                 let elapsed = frame_start.elapsed();
                 if elapsed < frame_time {
                     std::thread::sleep(frame_time - elapsed);
@@ -858,12 +875,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // ▸ Hand Size → Cutoff (small=dark, big=bright)
                 p.cutoff = 30.0 + hs * 9970.0;
 
-                // ▸ Velocity → Gain burst + slight detune
+                // ▸ Velocity → Gain burst + slight detune (silent when still)
                 if vel > 0.05 {
                     p.gain = (0.15 + v_boost * 0.5).min(0.75);
                     p.detune = 1.0 + v_boost * 0.008;
                 } else {
-                    p.gain = 0.25;
+                    p.gain = 0.0;
                     p.detune = 1.001;
                 }
                 p.grain_scat = v_boost * 0.3;
@@ -889,36 +906,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if has_head {
                     p.reverb_mix = (0.5 - head_ny * 0.4).clamp(0.0, 0.5);
                     p.mod_freq = 2.0 + head_nx * 6.0;
-                    p.mod_amt = 0.01 + head_ny * 0.07;
+                    p.mod_amt = 0.0;
                     p.head_x = head_nx;
                     p.head_y = head_ny;
                 } else {
                     p.reverb_mix = 0.1;
                     p.mod_freq = 2.0;
-                    p.mod_amt = 0.02;
+                    p.mod_amt = 0.0;
                 }
                 // Grain rate from hand size + velocity
                 p.grain_rate = 8.0 + hs * 8.0 + v_boost * 6.0;
                 p.grain_size = 0.02 + hs * 0.2;
 
-            } else if has_head {
-                // ▸ Head only → ambient drone
-                p.reverb_mix = (0.5 - head_ny * 0.4).clamp(0.0, 0.5);
-                p.freq = 60.0 + (1.0 - head_ny) * 440.0;
-                p.cutoff = 100.0 + (1.0 - head_ny) * 2000.0;
-                p.gain = 0.2;
-                p.pan = head_nx.clamp(0.0, 1.0);
-                p.mod_freq = 2.0 + head_nx * 4.0;
-                p.mod_amt = 0.015;
-                p.detune = 1.001;
-                p.grain_amt = 0.0;
-                p.grain_scat = 0.0;
-                p.head_x = head_nx;
-                p.head_y = head_ny;
-                prev_hx = 0.5;
-                prev_hy = 0.5;
             } else {
                 p.gain = 0.0;
+                p.freq = 440.0;
                 prev_hx = 0.5;
                 prev_hy = 0.5;
             }
@@ -944,7 +946,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let (rec_status, st_has_sample) = match sampler_state.try_lock() {
                     Ok(st) => {
-                        let status = if st.recording { format!("REC") }
+                        let status = if st.recording { "REC".to_string() }
                         else if st.has_sample { format!("{}L", st.layers.len()) }
                         else { "---".to_string() };
                         (status, st.has_sample)
