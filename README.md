@@ -1,4 +1,4 @@
-# cam_ratatui
+# cam_Granular noise modulator
 
 Turn your webcam into an ASCII-art terminal visualizer that doubles as a gesture-controlled synthesizer. Motion tracking on your hand/head/fingers maps live to a Faust-generated synth engine, with a built-in looper for layering recorded mic samples on top.
 
